@@ -32,6 +32,8 @@
 #include "bitfield.h"
 #include "utils.h"
 
+#include <openssl/ssl.h>
+
 typedef enum { TR_NET_OK, TR_NET_ERROR, TR_NET_WAIT } tr_tristate_t;
 
 enum
@@ -214,6 +216,9 @@ struct tr_session
     struct tr_bindinfo         * public_ipv6;
 
     uint8_t peer_id[PEER_ID_LEN+1];
+
+    SSL_CTX                    * tls_context;
+    EVP_PKEY                   * private_key;
 };
 
 static inline tr_port
@@ -321,6 +326,11 @@ tr_torrent * tr_sessionGetNextQueuedSeed( tr_session * session );
 tr_torrent * tr_sessionGetNextQueuedTorrent( tr_session * session, tr_direction );
 
 int tr_sessionCountQueueFreeSlots( tr_session * session, tr_direction );
+
+static inline SSL_CTX * tr_sessionGetTlsContext( tr_session * session )
+{
+    return session->tls_context;
+}
 
 
 #endif

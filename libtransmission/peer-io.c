@@ -20,6 +20,8 @@
 
 #include <libutp/utp.h>
 
+#include <openssl/err.h>
+
 #include "transmission.h"
 #include "session.h"
 #include "bandwidth.h"
@@ -81,16 +83,189 @@ guessPacketOverhead( size_t d )
 ***
 **/
 
+struct bio_internal
+{
+    const unsigned char * read_buf;
+    size_t read_length;
+    struct evbuffer * write_buf;
+};
+
+
+/* Called to initialize a new BIO */
+static int
+bio_peerio_new(BIO *b)
+{
+    b->init = 0;
+    b->num = -1;
+    b->ptr = NULL; /* We'll be putting the peerIO in this field.*/
+    b->flags = 0;
+    return 1;
+}
+
+/* Called to uninitialize the BIO. */
+static int
+bio_peerio_free(BIO *b)
+{
+    if (!b)
+        return 0;
+    if (b->shutdown) {
+        b->ptr = NULL;
+        b->init = 0;
+        b->flags = 0;
+        b->ptr = NULL;
+    }
+    return 1;
+}
+
+/* Called to extract data from the BIO. */
+static int
+bio_peerio_read(BIO *b, char *out, int outlen)
+{
+    int r = 0;
+    struct bio_internal *i;
+
+    BIO_clear_retry_flags( b );
+
+    if ( !out )
+         return 0;
+    if ( !b->ptr )
+         return -1;
+
+    i = b->ptr;
+    r = i->read_length;
+
+    if ( r == 0 )
+    {
+        /* If there's no data to read, say so. */
+        BIO_set_retry_read( b );
+        return -1;
+    }
+    else
+    {
+        r = MIN( r, outlen );
+        memcpy( out, i->read_buf, r );
+        i->read_length -= r;
+        i->read_buf += r;
+    }
+
+    return r;
+}
+
+/* Called to write data info the BIO */
+static int
+bio_peerio_write(BIO *b, const char *in, int inlen)
+{
+    struct bio_internal *i;
+
+    BIO_clear_retry_flags(b);
+
+    if (!b->ptr)
+        return -1;
+
+    i = b->ptr;
+
+    assert(inlen > 0);
+    evbuffer_add(i->write_buf, in, inlen);
+    return inlen;
+}
+
+/* Called to handle various requests */
+static long
+bio_peerio_ctrl(BIO *b, int cmd, long num, void *ptr UNUSED)
+{
+    struct bio_internal *i = b->ptr;
+    long ret = 1;
+
+    switch (cmd) {
+    case BIO_CTRL_GET_CLOSE:
+        ret = b->shutdown;
+        break;
+    case BIO_CTRL_SET_CLOSE:
+        b->shutdown = (int)num;
+        break;
+    case BIO_CTRL_PENDING:
+        ret = i->read_length != 0;
+        break;
+    case BIO_CTRL_WPENDING:
+        ret = evbuffer_get_length( i->write_buf ) != 0;
+        break;
+    /* XXXX These two are given a special-case treatment because
+     * of cargo-cultism.  I should come up with a better reason. */
+    case BIO_CTRL_DUP:
+    case BIO_CTRL_FLUSH:
+        ret = 1;
+        break;
+    default:
+        ret = 0;
+        break;
+    }
+    return ret;
+}
+
+/* Called to write a string to the BIO */
+static int
+bio_peerio_puts(BIO *b, const char *s)
+{
+    return bio_peerio_write(b, s, strlen(s));
+}
+
+#define BIO_TYPE_TR_PEERIO_PRIV 58
+
+/* Method table for the peerio BIO */
+static BIO_METHOD methods_peerio = {
+    BIO_TYPE_TR_PEERIO_PRIV, "tr_peerIo private",
+    bio_peerio_write,
+    bio_peerio_read,
+    bio_peerio_puts,
+    NULL /* bio_bufferevent_gets */,
+    bio_peerio_ctrl,
+    bio_peerio_new,
+    bio_peerio_free,
+    NULL /* callback_ctrl */,
+};
+
+/* Return the method table for the peerio BIO */
+static BIO_METHOD *
+BIO_s_peerio(void)
+{
+    return &methods_peerio;
+}
+
+static BIO *
+getBio( tr_peerIo * io )
+{
+    BIO * b = BIO_new( BIO_s_peerio() );
+    b->ptr = tr_new0( struct bio_internal, 1 );
+    ( (struct bio_internal *) b->ptr )->write_buf = tr_peerIoGetWriteBuffer( io );
+    b->init = 1;
+    return b;
+}
+
+static void
+initBioReadBuf( BIO * bio, const unsigned char* buf, size_t len)
+{
+    struct bio_internal *i = bio->ptr;
+
+    i->read_buf = buf;
+    i->read_length = len;
+}
+
+
+/**
+***
+**/
+
 struct tr_datatype
 {
     struct tr_datatype * next;
     size_t length;
+    size_t overhead;
     bool isPieceData;
 };
 
 static struct tr_datatype * datatype_pool = NULL;
 
-static const struct tr_datatype TR_DATATYPE_INIT = { NULL, 0, false };
+static const struct tr_datatype TR_DATATYPE_INIT = { NULL, 0, 0, false };
 
 static struct tr_datatype *
 datatype_new( void )
@@ -141,6 +316,18 @@ peer_io_push_datatype( tr_peerIo * io, struct tr_datatype * datatype )
     }
 }
 
+static struct tr_datatype *
+addDatatype( tr_peerIo * io, size_t byteCount, size_t overhead, bool isPieceData )
+{
+    struct tr_datatype * d;
+    d = datatype_new( );
+    d->isPieceData = isPieceData != 0;
+    d->length = byteCount;
+    d->overhead = overhead;
+    peer_io_push_datatype( io, d );
+    return d;
+}
+
 /***
 ****
 ***/
@@ -152,25 +339,31 @@ didWriteWrapper( tr_peerIo * io, unsigned int bytes_transferred )
      {
         struct tr_datatype * next = io->outbuf_datatypes;
 
-        const unsigned int payload = MIN( next->length, bytes_transferred );
+        const unsigned int overhead_transferred = MIN( next->overhead, bytes_transferred );
+        const unsigned int payload = MIN( next->length, bytes_transferred - overhead_transferred );
         /* For uTP sockets, the overhead is computed in utp_on_overhead. */
-        const unsigned int overhead =
+        const unsigned int overhead = overhead_transferred +
             io->socket ? guessPacketOverhead( payload ) : 0;
         const uint64_t now = tr_time_msec( );
 
-        tr_bandwidthUsed( &io->bandwidth, TR_UP, payload, next->isPieceData, now );
+        dbgmsg( io, "didWrite %u bytes overhead and %u bytes payload", overhead_transferred, payload );
+
+        if( payload > 0 )
+            tr_bandwidthUsed( &io->bandwidth, TR_UP, payload, next->isPieceData, now );
 
         if( overhead > 0 )
             tr_bandwidthUsed( &io->bandwidth, TR_UP, overhead, false, now );
 
-        if( io->didWrite )
+        if( io->didWrite && payload )
             io->didWrite( io, payload, next->isPieceData, io->userData );
 
         if( tr_isPeerIo( io ) )
         {
-            bytes_transferred -= payload;
+            bytes_transferred -= payload + overhead_transferred;
+            next->overhead -= overhead_transferred;
             next->length -= payload;
-            if( !next->length )
+
+            if( !next->length && !next->overhead )
                 peer_io_pull_datatype( io );
         }
     }
@@ -242,6 +435,154 @@ canReadWrapper( tr_peerIo * io )
     tr_peerIoUnref( io );
 }
 
+static int
+tlsDoRead( tr_peerIo * io, unsigned int * const howmuch )
+{
+    unsigned int bytesread = 0;
+    int res;
+    size_t outbuf_len = evbuffer_get_length( io->outbuf );
+
+    do
+    {
+        unsigned char pc;
+
+        res = SSL_peek( io->tls, &pc, 1 );
+
+        if ( res == 1 )
+        {
+            struct evbuffer_iovec iov[2];
+            int iov_given;
+            unsigned int howmuchnow = (unsigned)SSL_pending( io->tls );
+            howmuchnow = MIN( *howmuch - bytesread, howmuchnow );
+
+            iov_given = evbuffer_reserve_space( io->inbuf, howmuchnow, iov, 2 );
+
+            res = SSL_read( io->tls, iov[0].iov_base, MIN( howmuchnow, iov[0].iov_len ) );
+            bytesread += res;
+            if ( iov_given == 2 && res == (int)iov[0].iov_len )
+            {
+                res = SSL_read( io->tls, iov[1].iov_base, howmuchnow - iov[0].iov_len );
+                iov[1].iov_len = res;
+                bytesread += res;
+            }
+            else
+            {
+                iov[0].iov_len = res;
+            }
+
+            evbuffer_commit_space( io->inbuf, iov, iov_given );
+        }
+    } while ( res > 0 && bytesread < *howmuch );
+
+    outbuf_len = evbuffer_get_length( io->outbuf ) - outbuf_len;
+
+    if ( outbuf_len )
+    {
+        dbgmsg( io, "wrote %zu bytes while reading", outbuf_len );
+        if ( io->outbuf_datatypes )
+            io->outbuf_datatypes->overhead += outbuf_len;
+        else
+            addDatatype( io, 0, outbuf_len, false );
+    }
+
+    *howmuch = bytesread;
+
+    return res;
+}
+
+static size_t tlsWriteBuffer( tr_peerIo * io, struct evbuffer * buf );
+
+static void tlsTryWritePending( tr_peerIo * io )
+{
+    const size_t outbuf_len = evbuffer_get_length( io->outbuf );
+    size_t bytes_written = tlsWriteBuffer( io, io->outbuf_pending );
+
+    dbgmsg( io, "wrote %zu deferred bytes", bytes_written );
+
+    /* Charge the overhead to the first pending datatype. Not entirely fair
+        but this should happen infrequently enough for it not to matter. */
+    io->outbuf_pending_datatype->overhead += evbuffer_get_length( io->outbuf ) - outbuf_len - bytes_written;
+
+    evbuffer_drain( io->outbuf_pending, bytes_written );
+    if ( evbuffer_get_length( io->outbuf_pending ) == 0 )
+    {
+        evbuffer_free( io->outbuf_pending );
+        io->outbuf_pending = NULL;
+        io->outbuf_pending_datatype = NULL;
+        io->outbuf_pending_datatype_bytes = 0;
+    }
+    else
+    {
+        while ( bytes_written )
+        {
+            size_t datatype_bytes_written = MIN( io->outbuf_pending_datatype_bytes, bytes_written );
+            io->outbuf_pending_datatype_bytes -= datatype_bytes_written;
+            bytes_written -= datatype_bytes_written;
+            if ( io->outbuf_pending_datatype_bytes == 0 )
+            {
+                io->outbuf_pending_datatype = io->outbuf_pending_datatype->next;
+                io->outbuf_pending_datatype_bytes = io->outbuf_pending_datatype->length;
+            }
+        }
+    }
+}
+
+static unsigned int
+tlsCanRead( tr_peerIo * io, unsigned int howmuch )
+{
+    int res;
+    int e;
+    size_t curlen = evbuffer_get_length( io->inbuf );
+    char errstr[512];
+    short what = BEV_EVENT_READING;
+
+    res = tlsDoRead( io, &howmuch );
+    e = SSL_get_error( io->tls, res );
+
+    if ( ( res > 0 || e == SSL_ERROR_WANT_READ ) && io->outbuf_pending )
+    {
+        /* Writes have been held up waiting for read data so try
+        to write them out now that we've gotten some. */
+        tlsTryWritePending( io );
+    }
+
+    if ( res > 0 )
+    {
+        tr_peerIoSetEnabled( io, TR_DOWN, true );
+        canReadWrapper( io );
+    }
+    else
+    {
+        unsigned long error;
+
+        if( res == 0 ) /* EOF */
+            what |= BEV_EVENT_EOF;
+
+        /* SSL_ERROR_WANT_WRITE never happens because writes are bufferd in the io's outbuf */
+        if ( e == SSL_ERROR_WANT_READ )
+        {
+            tr_peerIoSetEnabled( io, TR_DOWN, true );
+
+            if ( evbuffer_get_length( io->inbuf ) > curlen )
+                /* Invoke the user callback - must always be called last */
+                canReadWrapper( io );
+            return res;
+        }
+        what |= BEV_EVENT_ERROR;
+
+        error = ERR_get_error();
+        ERR_error_string_n( error, errstr, 512 );
+
+        dbgmsg( io, "tlsCanRead got an error. res is %d, what is %hd, errno is %lu (%s)",
+                res, what, error, errstr );
+
+        if( io->gotError != NULL )
+            io->gotError( io, what, io->userData );
+    }
+
+    return howmuch;
+}
+
 static void
 event_read_cb( int fd, short event UNUSED, void * vio )
 {
@@ -272,37 +613,44 @@ event_read_cb( int fd, short event UNUSED, void * vio )
         return;
     }
 
-    EVUTIL_SET_SOCKET_ERROR( 0 );
-    res = evbuffer_read( io->inbuf, fd, (int)howmuch );
-    e = EVUTIL_SOCKET_ERROR( );
-
-    if( res > 0 )
+    if ( io->tls )
     {
-        tr_peerIoSetEnabled( io, dir, true );
-
-        /* Invoke the user callback - must always be called last */
-        canReadWrapper( io );
+        tlsCanRead( io, howmuch );
     }
     else
     {
-        char errstr[512];
-        short what = BEV_EVENT_READING;
+        EVUTIL_SET_SOCKET_ERROR( 0 );
+        res = evbuffer_read( io->inbuf, fd, (int)howmuch );
+        e = EVUTIL_SOCKET_ERROR( );
 
-        if( res == 0 ) /* EOF */
-            what |= BEV_EVENT_EOF;
-        else if( res == -1 ) {
-            if( e == EAGAIN || e == EINTR ) {
-                tr_peerIoSetEnabled( io, dir, true );
-                return;
-            }
-            what |= BEV_EVENT_ERROR;
+        if( res > 0 )
+        {
+            tr_peerIoSetEnabled( io, dir, true );
+
+            /* Invoke the user callback - must always be called last */
+            canReadWrapper( io );
         }
+        else
+        {
+            char errstr[512];
+            short what = BEV_EVENT_READING;
 
-        dbgmsg( io, "event_read_cb got an error. res is %d, what is %hd, errno is %d (%s)",
-                res, what, e, tr_net_strerror( errstr, sizeof( errstr ), e ) );
+            if( res == 0 ) /* EOF */
+                what |= BEV_EVENT_EOF;
+            else if( res == -1 ) {
+                if( e == EAGAIN || e == EINTR ) {
+                    tr_peerIoSetEnabled( io, dir, true );
+                    return;
+                }
+                what |= BEV_EVENT_ERROR;
+            }
 
-        if( io->gotError != NULL )
-            io->gotError( io, what, io->userData );
+            dbgmsg( io, "event_read_cb got an error. res is %d, what is %hd, errno is %d (%s)",
+                    res, what, e, tr_net_strerror( errstr, sizeof( errstr ), e ) );
+
+            if( io->gotError != NULL )
+                io->gotError( io, what, io->userData );
+        }
     }
 }
 
@@ -408,20 +756,34 @@ maybeSetCongestionAlgorithm( int socket, const char * algorithm )
 static void
 utp_on_read(void *closure, const unsigned char *buf, size_t buflen)
 {
-    int rc;
     tr_peerIo *io = closure;
     assert( tr_isPeerIo( io ) );
 
-    rc = evbuffer_add( io->inbuf, buf, buflen );
-    dbgmsg( io, "utp_on_read got %zu bytes", buflen );
+    dbgmsg( io, "utp_on_read reading %zu bytes...", buflen );
 
-    if( rc < 0 ) {
-        tr_nerr( "UTP", "On read evbuffer_add" );
-        return;
+    if ( io->tls )
+    {
+        int res;
+        initBioReadBuf( SSL_get_rbio( io->tls ), buf, buflen );
+        res = tlsCanRead( io, UINT_MAX );
+        if ( res > 0 && tr_isPeerIo( io ) )
+        {
+            assert( BIO_pending( SSL_get_rbio( io->tls ) ) == 0 );
+        }
+     }
+    else
+    {
+        int rc = evbuffer_add( io->inbuf, buf, buflen );
+
+        if( rc < 0 ) {
+            tr_nerr( "UTP", "On read evbuffer_add" );
+            return;
+        }
+
+        tr_peerIoSetEnabled( io, TR_DOWN, true );
+        canReadWrapper( io );
     }
 
-    tr_peerIoSetEnabled( io, TR_DOWN, true );
-    canReadWrapper( io );
 }
 
 static void
@@ -810,8 +1172,11 @@ io_dtor( void * vio )
     tr_bandwidthDestruct( &io->bandwidth );
     evbuffer_free( io->outbuf );
     evbuffer_free( io->inbuf );
+    if ( io->outbuf_pending )
+        evbuffer_free( io->outbuf_pending );
     io_close_socket( io );
     tr_cryptoDestruct( &io->crypto );
+    SSL_free( io->tls );
 
     while( io->outbuf_datatypes != NULL )
         peer_io_pull_datatype( io );
@@ -1019,21 +1384,68 @@ tr_peerIoSetEncryption( tr_peerIo * io, tr_encryption_type encryption_type )
          || encryption_type == PEER_ENCRYPTION_RC4 );
 
     io->encryption_type = encryption_type;
+
+    if ( io->tls )
+    {
+        SSL_free( io->tls );
+        io->tls = NULL;
+    }
+}
+
+int
+tr_peerIoSetTlsEncryption( tr_peerIo * io, SSL * tls )
+{
+    int res = 1;
+    BIO * io_bio;
+
+    assert( tr_isPeerIo( io ) );
+
+    if ( io->tls )
+    {
+        SSL_free( io->tls );
+    }
+
+    io->encryption_type = PEER_ENCRYPTION_NONE;
+    io->tls = tls;
+
+    /* The TLS handshake has already been completed so any
+       data currently in the inbuf is TLS records with application data.
+       Use a memory BIO to feed the data to the TLS object. */
+    if ( evbuffer_get_length( io->inbuf ) )
+    {
+        unsigned int howmuch = UINT_MAX;
+        BIO * inbio = BIO_new( BIO_s_mem() );
+        struct evbuffer_ptr pos;
+        struct evbuffer_iovec iovec;
+
+        evbuffer_ptr_set( io->inbuf, &pos, 0, EVBUFFER_PTR_SET );
+        SSL_set_bio( tls, inbio, NULL );
+
+        do {
+            evbuffer_peek( io->inbuf, -1, &pos, &iovec, 1 );
+            BIO_write( inbio, iovec.iov_base, iovec.iov_len );
+        } while( !evbuffer_ptr_set( io->inbuf, &pos, iovec.iov_len, EVBUFFER_PTR_ADD ) );
+
+        evbuffer_drain( io->inbuf, BIO_ctrl_pending( inbio ) );
+        res = tlsDoRead( io, &howmuch );
+    }
+
+    io_bio = getBio( io );
+
+    if ( !io->utp_socket )
+    {
+        SSL_set_bio( tls, NULL, io_bio );
+        SSL_set_rfd( tls, io->socket );
+    }
+    else
+        SSL_set_bio( tls, io_bio, io_bio );
+
+    return res;
 }
 
 /**
 ***
 **/
-
-static void
-addDatatype( tr_peerIo * io, size_t byteCount, bool isPieceData )
-{
-    struct tr_datatype * d;
-    d = datatype_new( );
-    d->isPieceData = isPieceData != 0;
-    d->length = byteCount;
-    peer_io_push_datatype( io, d );
-}
 
 static void
 maybeEncryptBuffer( tr_peerIo * io, struct evbuffer * buf )
@@ -1050,29 +1462,116 @@ maybeEncryptBuffer( tr_peerIo * io, struct evbuffer * buf )
     }
 }
 
+static size_t
+tlsWriteBuffer( tr_peerIo * io, struct evbuffer * buf )
+{
+    struct evbuffer_ptr pos;
+    struct evbuffer_iovec iovec;
+    int res;
+    int e;
+    size_t bytesWritten = 0;
+
+    evbuffer_ptr_set( buf, &pos, 0, EVBUFFER_PTR_SET );
+    do {
+        evbuffer_peek( buf, -1, &pos, &iovec, 1 );
+        res = SSL_write( io->tls, iovec.iov_base, iovec.iov_len );
+        e = SSL_get_error( io->tls, res );
+
+        if ( e == SSL_ERROR_WANT_READ )
+            tr_peerIoSetEnabled( io, TR_DOWN, true );
+        if ( res > 0 )
+            bytesWritten += res;
+    } while( res > 0 && !evbuffer_ptr_set( buf, &pos, iovec.iov_len, EVBUFFER_PTR_ADD ) );
+
+    return bytesWritten;
+}
+
 void
 tr_peerIoWriteBuf( tr_peerIo * io, struct evbuffer * buf, bool isPieceData )
 {
     const size_t byteCount = evbuffer_get_length( buf );
-    maybeEncryptBuffer( io, buf );
-    evbuffer_add_buffer( io->outbuf, buf );
-    addDatatype( io, byteCount, isPieceData );
+    size_t overhead = 0;
+
+    if ( io->tls )
+    {
+        struct tr_datatype * datatype;
+        size_t bytesWritten;
+
+        if ( !io->outbuf_pending )
+        {
+            overhead = evbuffer_get_length( io->outbuf );
+            bytesWritten = tlsWriteBuffer( io, buf );
+            overhead = evbuffer_get_length( io->outbuf ) - overhead - bytesWritten;
+            evbuffer_drain( buf, bytesWritten );
+        }
+
+        datatype = addDatatype( io, byteCount, overhead, isPieceData );
+
+        if ( evbuffer_get_length( buf ) )
+        {
+            if ( !io->outbuf_pending )
+            {
+                io->outbuf_pending = evbuffer_new();
+                io->outbuf_pending_datatype = datatype;
+                io->outbuf_pending_datatype_bytes = byteCount - bytesWritten;
+            }
+            dbgmsg( io, "deferring write of %zu bytes", io->outbuf_pending_datatype_bytes );
+            evbuffer_add_buffer( io->outbuf_pending, buf );
+        }
+    }
+    else
+    {
+        maybeEncryptBuffer( io, buf );
+        evbuffer_add_buffer( io->outbuf, buf );
+        addDatatype( io, byteCount, overhead, isPieceData );
+    }
 }
 
 void
 tr_peerIoWriteBytes( tr_peerIo * io, const void * bytes, size_t byteCount, bool isPieceData )
 {
     struct evbuffer_iovec iovec;
-    evbuffer_reserve_space( io->outbuf, byteCount, &iovec, 1 );
+    size_t overhead = 0;
 
-    iovec.iov_len = byteCount;
-    if( io->encryption_type == PEER_ENCRYPTION_RC4 )
-        tr_cryptoEncrypt( &io->crypto, iovec.iov_len, bytes, iovec.iov_base );
+    if ( io->tls )
+    {
+        struct tr_datatype * datatype;
+        int res;
+        int e;
+        overhead = evbuffer_get_length( io->outbuf );
+        res = SSL_write(io->tls, bytes, byteCount);
+        e = SSL_get_error( io->tls, res );
+        overhead = evbuffer_get_length( io->outbuf ) - overhead - byteCount;
+
+        datatype = addDatatype( io, byteCount, overhead, isPieceData );
+
+        if ( e == SSL_ERROR_WANT_READ )
+            tr_peerIoSetEnabled( io, TR_DOWN, true );
+
+        if ( res > 0 && (unsigned)res < byteCount )
+        {
+            if ( !io->outbuf_pending )
+            {
+                io->outbuf_pending = evbuffer_new();
+                io->outbuf_pending_datatype = datatype;
+                io->outbuf_pending_datatype_bytes = byteCount - res;
+            }
+            evbuffer_add( io->outbuf_pending, (const unsigned char*)bytes + res, byteCount - res );
+        }
+
+    }
     else
-        memcpy( iovec.iov_base, bytes, iovec.iov_len );
-    evbuffer_commit_space( io->outbuf, &iovec, 1 );
+    {
+        evbuffer_reserve_space( io->outbuf, byteCount, &iovec, 1 );
 
-    addDatatype( io, byteCount, isPieceData );
+        iovec.iov_len = byteCount;
+        if( io->encryption_type == PEER_ENCRYPTION_RC4 )
+            tr_cryptoEncrypt( &io->crypto, iovec.iov_len, bytes, iovec.iov_base );
+        else
+            memcpy( iovec.iov_base, bytes, iovec.iov_len );
+        evbuffer_commit_space( io->outbuf, &iovec, 1 );
+        addDatatype( io, byteCount, overhead, isPieceData );
+    }
 }
 
 /***
@@ -1214,6 +1713,10 @@ tr_peerIoTryRead( tr_peerIo * io, size_t howmuch )
             if( evbuffer_get_length( io->inbuf ) == 0 )
                 UTP_RBDrained( io->utp_socket );
         }
+        else if ( io->tls ) /* tls peer connection */
+        {
+            res = tlsCanRead( io, howmuch );
+        }
         else /* tcp peer connection */
         {
             int e;
@@ -1318,7 +1821,7 @@ tr_peerIoFlushOutgoingProtocolMsgs( tr_peerIo * io )
         if( it->isPieceData )
             break;
         else
-            byteCount += it->length;
+            byteCount += it->length + it->overhead;
 
     return tr_peerIoFlush( io, TR_UP, byteCount );
 }

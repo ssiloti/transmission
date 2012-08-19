@@ -18,6 +18,7 @@
 #include <signal.h>
 #include <sys/types.h> /* stat(), umask() */
 #include <sys/stat.h> /* stat(), umask() */
+#include <fcntl.h>
 #include <unistd.h> /* stat */
 #include <dirent.h> /* opendir */
 
@@ -25,6 +26,8 @@
 #include <event2/event.h>
 
 #include <libutp/utp.h>
+
+#include <openssl/err.h>
 
 //#define TR_SHOW_DEPRECATED
 #include "transmission.h"
@@ -662,6 +665,79 @@ onNowTimer( int foo UNUSED, short bar UNUSED, void * vsession )
 
 static void loadBlocklists( tr_session * session );
 
+static int
+tlsVerifyCallback( int ok, X509_STORE_CTX * store)
+{
+    if ( !ok ) {
+        if ( X509_STORE_CTX_get_error( store ) == X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT )
+            ok = 1;
+    }
+
+    return ok;
+}
+
+static void
+initTlsContext( tr_session * session )
+{
+    char * filename = tr_buildPath( session->configDir, "client_id.pem", NULL );
+    X509 * cert;
+    X509_NAME * name;
+
+    SSL_library_init();
+    ERR_load_ERR_strings();
+    session->tls_context = SSL_CTX_new( TLSv1_method() );
+    SSL_CTX_set_session_id_context( session->tls_context, (const unsigned char*)TR_NAME, sizeof(TR_NAME) );
+
+    if (SSL_CTX_use_PrivateKey_file( session->tls_context, filename, SSL_FILETYPE_PEM ) > 0)
+    {
+        FILE * fp = fopen( filename, "r" );
+        PEM_read_PrivateKey( fp, &session->private_key, NULL, NULL );
+        fclose( fp );
+    }
+    else
+    {
+        FILE * fp;
+        int fd;
+
+        session->private_key = EVP_PKEY_new();
+        EVP_PKEY_assign_RSA( session->private_key, RSA_generate_key( 2048, RSA_F4, NULL, NULL ) );
+
+        /* Make sure the private key is only written if the file is known to have been created
+           with the correct permissions */
+        fd = open( filename, O_CREAT | O_EXCL | O_WRONLY, S_IRUSR | S_IWUSR );
+        if ( fd != -1 )
+        {
+            close( fd );
+            fp = fopen( filename, "w" );
+            PEM_write_PrivateKey( fp, session->private_key, NULL, NULL, 0, NULL, NULL );
+            fclose( fp );
+        }
+    }
+
+    tr_free( filename );
+
+    cert = X509_new();
+
+    X509_set_version( cert, 2 );
+    ASN1_INTEGER_set( X509_get_serialNumber( cert ), 1 );
+    ASN1_UTCTIME_set_string( X509_get_notBefore( cert ), "000101000000Z" );
+    ASN1_GENERALIZEDTIME_set_string( X509_get_notAfter( cert ), "99991231235959Z" );
+    X509_set_pubkey( cert, session->private_key );
+
+    name = X509_get_subject_name( cert );
+
+    X509_NAME_add_entry_by_txt( name, "CN", MBSTRING_ASC, (const unsigned char*)TR_NAME "/" USERAGENT_PREFIX, -1, -1, 0 );
+    X509_set_issuer_name( cert, name );
+
+    X509_sign( cert, session->private_key, EVP_sha1() );
+
+    SSL_CTX_use_certificate( session->tls_context, cert );
+    SSL_CTX_use_PrivateKey( session->tls_context, session->private_key );
+    SSL_CTX_set_verify( session->tls_context, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, tlsVerifyCallback);
+
+    X509_free( cert );
+}
+
 static void
 tr_sessionInitImpl( void * vdata )
 {
@@ -707,6 +783,8 @@ tr_sessionInitImpl( void * vdata )
         tr_free( filename );
         loadBlocklists( session );
     }
+
+    initTlsContext( session );
 
     assert( tr_isSession( session ) );
 
@@ -1866,6 +1944,8 @@ tr_sessionClose( tr_session * session )
         tr_bencFree( session->metainfoLookup );
         tr_free( session->metainfoLookup );
     }
+    SSL_CTX_free( session->tls_context );
+    ERR_free_strings();
     tr_free( session->torrentDoneScript );
     tr_free( session->tag );
     tr_free( session->configDir );

@@ -20,6 +20,8 @@
 #include <event2/bufferevent.h>
 #include <event2/event.h>
 
+#include <openssl/err.h>
+
 #include "transmission.h"
 #include "bencode.h"
 #include "cache.h"
@@ -29,6 +31,7 @@
 #include "peer-mgr.h"
 #include "peer-msgs.h"
 #include "session.h"
+#include "tls-handshake.h"
 #include "torrent.h"
 #include "torrent-magnet.h"
 #include "tr-dht.h"
@@ -64,6 +67,7 @@ enum
 
     UT_PEX_ID               = 1,
     UT_METADATA_ID          = 3,
+    TR_STARTTLS_ID          = 4,
 
     MAX_PEX_PEER_COUNT      = 50,
 
@@ -97,7 +101,8 @@ enum
     AWAITING_BT_LENGTH,
     AWAITING_BT_ID,
     AWAITING_BT_MESSAGE,
-    AWAITING_BT_PIECE
+    AWAITING_BT_PIECE,
+    AWAITING_SECURE_TRANSPORT
 };
 
 /**
@@ -153,8 +158,16 @@ struct tr_peermsgs
 {
     bool            peerSupportsPex;
     bool            peerSupportsMetadataXfer;
+    bool            peerSupportsStartTls;
     bool            clientSentLtepHandshake;
     bool            peerSentLtepHandshake;
+    bool            clientSentStarttls;
+    bool            peerSentStarttls;
+
+    /* Stop writing any data to peer->io after this many bytes have
+       have been flushed from outMessages.
+       A value of SIZE_MAX indicates that no limit is in effect */
+    size_t          pauseOutputAfter;
 
     /*bool          haveFastSet;*/
 
@@ -170,6 +183,7 @@ struct tr_peermsgs
     uint8_t         state;
     uint8_t         ut_pex_id;
     uint8_t         ut_metadata_id;
+    uint8_t         tr_starttls_id;
     uint16_t        pexCount;
     uint16_t        pexCount6;
 
@@ -832,6 +846,7 @@ sendLtepHandshake( tr_peermsgs * msgs )
             tr_bencDictAddInt( m, "ut_metadata", UT_METADATA_ID );
         if( allow_pex )
             tr_bencDictAddInt( m, "ut_pex", UT_PEX_ID );
+        tr_bencDictAddInt( m, "tr_starttls", TR_STARTTLS_ID );
     }
 
     payload = tr_bencToBuf( &val, TR_FMT_BENC );
@@ -847,6 +862,8 @@ sendLtepHandshake( tr_peermsgs * msgs )
     evbuffer_free( payload );
     tr_bencFree( &val );
 }
+
+static void sendStarttls( tr_peermsgs * msgs );
 
 static void
 parseLtepHandshake( tr_peermsgs * msgs, int len, struct evbuffer * inbuf )
@@ -884,6 +901,7 @@ parseLtepHandshake( tr_peermsgs * msgs, int len, struct evbuffer * inbuf )
     /* check supported messages for utorrent pex */
     msgs->peerSupportsPex = 0;
     msgs->peerSupportsMetadataXfer = 0;
+    msgs->peerSupportsStartTls = 0;
 
     if( tr_bencDictFindDict( &val, "m", &sub ) ) {
         if( tr_bencDictFindInt( sub, "ut_pex", &i ) ) {
@@ -895,6 +913,13 @@ parseLtepHandshake( tr_peermsgs * msgs, int len, struct evbuffer * inbuf )
             msgs->peerSupportsMetadataXfer = i != 0;
             msgs->ut_metadata_id = (uint8_t) i;
             dbgmsg( msgs, "msgs->ut_metadata_id is %d", (int)msgs->ut_metadata_id );
+        }
+        if( tr_bencDictFindInt( sub, "tr_starttls", &i ) ) {
+            msgs->peerSupportsStartTls = i != 0;
+            msgs->tr_starttls_id = (uint8_t) i;
+            if( !tr_peerIoIsIncoming( msgs->peer->io ) )
+                sendStarttls( msgs );
+            dbgmsg( msgs, "msgs->tr_starttls_id is %d", (int)msgs->tr_starttls_id );
         }
         if( tr_bencDictFindInt( sub, "ut_holepunch", &i ) ) {
             /* Mysterious µTorrent extension that we don't grok.  However,
@@ -1088,6 +1113,29 @@ parseUtPex( tr_peermsgs * msgs, int msglen, struct evbuffer * inbuf )
     tr_free( tmp );
 }
 
+static bool doStarttlsHandshake( tr_peerIo * io, tr_peermsgs * msgs );
+
+static void
+parseTrStarttls( tr_peermsgs * msgs, int msglen, struct evbuffer * inbuf )
+{
+    evbuffer_drain( inbuf, msglen );
+
+    if ( !msgs->peer->io->tls )
+    {
+        msgs->peerSentStarttls = true;
+        msgs->state = AWAITING_SECURE_TRANSPORT;
+
+        if ( !msgs->clientSentStarttls )
+        {
+            sendStarttls( msgs );
+        }
+        else
+        {
+            doStarttlsHandshake( msgs->peer->io, msgs );
+        }
+    }
+}
+
 static void sendPex( tr_peermsgs * msgs );
 
 static void
@@ -1119,6 +1167,12 @@ parseLtep( tr_peermsgs * msgs, int msglen, struct evbuffer  * inbuf )
         dbgmsg( msgs, "got ut metadata" );
         msgs->peerSupportsMetadataXfer = 1;
         parseUtMetadata( msgs, msglen, inbuf );
+    }
+    else if( ltep_msgid == TR_STARTTLS_ID )
+    {
+        dbgmsg( msgs, "got tr starttls" );
+        msgs->peerSupportsStartTls = 1;
+        parseTrStarttls( msgs, msglen, inbuf );
     }
     else
     {
@@ -1545,8 +1599,15 @@ assert( tr_bitfieldHasAll( &msgs->peer->have ) );
     assert( msglen + 1 == msgs->incoming.length );
     assert( evbuffer_get_length( inbuf ) == startBufLen - msglen );
 
-    msgs->state = AWAITING_BT_LENGTH;
-    return READ_NOW;
+    if ( msgs->state != AWAITING_SECURE_TRANSPORT )
+    {
+        msgs->state = AWAITING_BT_LENGTH;
+        return READ_NOW;
+    }
+    else
+    {
+        return READ_LATER;
+    }
 }
 
 /* returns 0 on success, or an errno on failure */
@@ -1600,7 +1661,10 @@ didWrite( tr_peerIo * io UNUSED, size_t bytesWritten, int wasPieceData, void * v
     firePeerGotData( msgs, bytesWritten, wasPieceData );
 
     if ( tr_isPeerIo( io ) && io->userData )
-        peerPulse( msgs );
+    {
+        if ( !doStarttlsHandshake( io, msgs ) )
+            peerPulse( msgs );
+    }
 }
 
 static ReadState
@@ -1631,6 +1695,9 @@ canRead( tr_peerIo * io, void * vmsgs, size_t * piece )
 
         case AWAITING_BT_MESSAGE:
             ret = readBtMessage( msgs, in, inlen ); break;
+
+        case AWAITING_SECURE_TRANSPORT:
+            ret = READ_LATER; break;
 
         default:
             ret = READ_ERR;
@@ -1770,7 +1837,7 @@ fillOutputBuffer( tr_peermsgs * msgs, time_t now )
     int piece;
     size_t bytesWritten = 0;
     struct peer_request req;
-    const bool haveMessages = evbuffer_get_length( msgs->outMessages ) != 0;
+    const bool haveMessages = MIN( evbuffer_get_length( msgs->outMessages ), msgs->pauseOutputAfter ) != 0;
     const bool fext = tr_peerIoSupportsFEXT( msgs->peer->io );
 
     /**
@@ -1784,15 +1851,30 @@ fillOutputBuffer( tr_peermsgs * msgs, time_t now )
     }
     else if( haveMessages && ( ( now - msgs->outMessagesBatchedAt ) >= msgs->outMessagesBatchPeriod ) )
     {
-        const size_t len = evbuffer_get_length( msgs->outMessages );
+        const size_t len = MIN( evbuffer_get_length( msgs->outMessages ), msgs->pauseOutputAfter );
         /* flush the protocol messages */
         dbgmsg( msgs, "flushing outMessages... to %p (length is %zu)", msgs->peer->io, len );
-        tr_peerIoWriteBuf( msgs->peer->io, msgs->outMessages, false );
+        if ( len < evbuffer_get_length( msgs->outMessages ) )
+        {
+            struct evbuffer * tmp = evbuffer_new( );
+            evbuffer_remove_buffer( msgs->outMessages, tmp, len );
+            tr_peerIoWriteBuf( msgs->peer->io, tmp, false );
+            evbuffer_free( tmp );
+        }
+        else
+        {
+            tr_peerIoWriteBuf( msgs->peer->io, msgs->outMessages, false );
+        }
         msgs->clientSentAnythingAt = now;
         msgs->outMessagesBatchedAt = 0;
         msgs->outMessagesBatchPeriod = LOW_PRIORITY_INTERVAL_SECS;
         bytesWritten +=  len;
+        if ( msgs->pauseOutputAfter != SIZE_MAX )
+            msgs->pauseOutputAfter -= len;
     }
+
+    if ( msgs->pauseOutputAfter != SIZE_MAX )
+        return bytesWritten;
 
     /**
     ***  Metadata Pieces
@@ -2320,6 +2402,71 @@ pexPulse( int foo UNUSED, short bar UNUSED, void * vmsgs )
 ***
 **/
 
+static void
+tlshandshakeDone( struct tr_sslhandshake * handshake,
+                  struct tr_peerIo       * io,
+                  bool                     isOk,
+                  void                   * userData )
+{
+    tr_peermsgs * msgs = userData;
+
+    dbgmsg( msgs, "TLS handshake done, ok? %d", isOk );
+
+    tr_peerIoSetIOFuncs( io, canRead, didWrite, gotError, msgs );
+    tr_sslhandshakeFree( handshake );
+
+    if ( isOk )
+    {
+        msgs->clientSentStarttls = msgs->peerSentStarttls = false;
+        msgs->pauseOutputAfter = SIZE_MAX;
+        msgs->state = AWAITING_BT_LENGTH;
+        peerPulse( msgs );
+    }
+    else
+    {
+        fireError( msgs, ENOTCONN );
+    }
+}
+
+static bool doStarttlsHandshake( tr_peerIo * io, tr_peermsgs * msgs )
+{
+    bool ret = false;
+
+    if (  msgs->clientSentStarttls
+       && msgs->peerSentStarttls
+       && msgs->pauseOutputAfter == 0
+       && evbuffer_get_length( tr_peerIoGetWriteBuffer( io ) ) == 0 )
+    {
+        dbgmsg( msgs, "Starting TLS handshake" );
+        tr_sslhandshakeNew( io, tlshandshakeDone, msgs );
+        ret = true;
+    }
+
+    return ret;
+}
+
+static void
+sendStarttls( tr_peermsgs * msgs )
+{
+    struct evbuffer * out = msgs->outMessages;
+
+    if ( !msgs->clientSentStarttls && !msgs->peer->io->tls )
+    {
+        msgs->clientSentStarttls = true;
+
+        evbuffer_add_uint32( out, 2 * sizeof( uint8_t ) );
+        evbuffer_add_uint8 ( out, BT_LTEP );
+        evbuffer_add_uint8 ( out, msgs->tr_starttls_id );
+
+        msgs->pauseOutputAfter = evbuffer_get_length( out );
+        pokeBatchPeriod( msgs, IMMEDIATE_PRIORITY_INTERVAL_SECS );
+    }
+}
+
+/**
+***
+**/
+
 tr_peermsgs*
 tr_peerMsgsNew( struct tr_torrent    * torrent,
                 struct tr_peer       * peer,
@@ -2344,6 +2491,7 @@ tr_peerMsgsNew( struct tr_torrent    * torrent,
     m->outMessages = evbuffer_new( );
     m->outMessagesBatchedAt = 0;
     m->outMessagesBatchPeriod = LOW_PRIORITY_INTERVAL_SECS;
+    m->pauseOutputAfter = SIZE_MAX;
     peer->msgs = m;
 
     if( tr_torrentAllowsPex( torrent ) ) {

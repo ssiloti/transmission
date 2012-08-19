@@ -29,6 +29,8 @@
 #include "net.h" /* tr_address */
 #include "utils.h" /* tr_time() */
 
+#include <openssl/ssl.h>
+
 struct evbuffer;
 struct tr_bandwidth;
 struct tr_datatype;
@@ -108,10 +110,19 @@ typedef struct tr_peerIo
 
     struct tr_bandwidth   bandwidth;
     tr_crypto             crypto;
+    SSL                 * tls;
 
     struct evbuffer     * inbuf;
     struct evbuffer     * outbuf;
     struct tr_datatype  * outbuf_datatypes;
+
+    /* TLS renegociation can cause writes to fail pending read data at arbitrary
+       points in time. Rather than force peerio's clients to handle partial write
+       failures a separate holding buffer is allocated. Additional variables are
+       used to track where the head of the pending buffer is in the datatype list. */
+    struct evbuffer     * outbuf_pending;
+    struct tr_datatype  * outbuf_pending_datatype;
+    size_t                outbuf_pending_datatype_bytes;
 
     struct event        * event_read;
     struct event        * event_write;
@@ -288,6 +299,7 @@ static inline tr_crypto * tr_peerIoGetCrypto( tr_peerIo * io )
 }
 
 void tr_peerIoSetEncryption( tr_peerIo * io, tr_encryption_type encryption_type );
+int tr_peerIoSetTlsEncryption( tr_peerIo * io, SSL * tls );
 
 static inline bool
 tr_peerIoIsEncrypted( const tr_peerIo * io )
@@ -397,6 +409,11 @@ int       tr_peerIoFlushOutgoingProtocolMsgs( tr_peerIo * io );
 static inline struct evbuffer * tr_peerIoGetReadBuffer( tr_peerIo * io )
 {
     return io->inbuf;
+}
+
+static inline struct evbuffer * tr_peerIoGetWriteBuffer( tr_peerIo * io )
+{
+    return io->outbuf;
 }
 
 /* @} */
