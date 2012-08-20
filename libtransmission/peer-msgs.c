@@ -805,6 +805,7 @@ sendLtepHandshake( tr_peermsgs * msgs )
     tr_benc val;
     bool allow_pex;
     bool allow_metadata_xfer;
+    bool allow_starttls;
     struct evbuffer * payload;
     struct evbuffer * out = msgs->outMessages;
     const unsigned char * ipv6 = tr_globalIPv6();
@@ -829,6 +830,14 @@ sendLtepHandshake( tr_peermsgs * msgs )
     else
         allow_pex = 1;
 
+    if ( tr_sessionIsTLSEnabled( msgs->torrent->session ) )
+        allow_starttls = 1;
+    else
+    {
+        allow_starttls = 0;
+        msgs->clientSentStarttls = 1;
+    }
+
     tr_bencInitDict( &val, 8 );
     tr_bencDictAddInt( &val, "e", getSession(msgs)->encryptionMode != TR_CLEAR_PREFERRED );
     if( ipv6 != NULL )
@@ -840,13 +849,14 @@ sendLtepHandshake( tr_peermsgs * msgs )
     tr_bencDictAddInt( &val, "reqq", REQQ );
     tr_bencDictAddInt( &val, "upload_only", tr_torrentIsSeed( msgs->torrent ) );
     tr_bencDictAddStr( &val, "v", TR_NAME " " USERAGENT_PREFIX );
-    if( allow_metadata_xfer || allow_pex ) {
+    if( allow_metadata_xfer || allow_pex || allow_starttls ) {
         tr_benc * m  = tr_bencDictAddDict( &val, "m", 2 );
         if( allow_metadata_xfer )
             tr_bencDictAddInt( m, "ut_metadata", UT_METADATA_ID );
         if( allow_pex )
             tr_bencDictAddInt( m, "ut_pex", UT_PEX_ID );
-        tr_bencDictAddInt( m, "tr_starttls", TR_STARTTLS_ID );
+        if ( allow_starttls )
+            tr_bencDictAddInt( m, "tr_starttls", TR_STARTTLS_ID );
     }
 
     payload = tr_bencToBuf( &val, TR_FMT_BENC );
@@ -917,7 +927,7 @@ parseLtepHandshake( tr_peermsgs * msgs, int len, struct evbuffer * inbuf )
         if( tr_bencDictFindInt( sub, "tr_starttls", &i ) ) {
             msgs->peerSupportsStartTls = i != 0;
             msgs->tr_starttls_id = (uint8_t) i;
-            if( !tr_peerIoIsIncoming( msgs->peer->io ) )
+            if( tr_sessionIsTLSEnabled( msgs->torrent->session ) && !tr_peerIoIsIncoming( msgs->peer->io ) )
                 sendStarttls( msgs );
             dbgmsg( msgs, "msgs->tr_starttls_id is %d", (int)msgs->tr_starttls_id );
         }

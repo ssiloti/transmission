@@ -314,6 +314,7 @@ tr_sessionGetDefaultSettings( tr_benc * d )
     tr_bencDictAddInt ( d, TR_PREFS_KEY_MAX_CACHE_SIZE_MB,               DEFAULT_CACHE_SIZE_MB );
     tr_bencDictAddBool( d, TR_PREFS_KEY_DHT_ENABLED,                     true );
     tr_bencDictAddBool( d, TR_PREFS_KEY_UTP_ENABLED,                     true );
+    tr_bencDictAddBool( d, TR_PREFS_KEY_TLS_ENABLED,                     false );
     tr_bencDictAddBool( d, TR_PREFS_KEY_LPD_ENABLED,                     false );
     tr_bencDictAddStr ( d, TR_PREFS_KEY_DOWNLOAD_DIR,                    tr_getDefaultDownloadDir( ) );
     tr_bencDictAddInt ( d, TR_PREFS_KEY_DSPEED_KBps,                     100 );
@@ -384,6 +385,7 @@ tr_sessionGetSettings( tr_session * s, struct tr_benc * d )
     tr_bencDictAddInt ( d, TR_PREFS_KEY_MAX_CACHE_SIZE_MB,                tr_sessionGetCacheLimit_MB( s ) );
     tr_bencDictAddBool( d, TR_PREFS_KEY_DHT_ENABLED,                      s->isDHTEnabled );
     tr_bencDictAddBool( d, TR_PREFS_KEY_UTP_ENABLED,                      s->isUTPEnabled );
+    tr_bencDictAddBool( d, TR_PREFS_KEY_TLS_ENABLED,                      s->isTLSEnabled );
     tr_bencDictAddBool( d, TR_PREFS_KEY_LPD_ENABLED,                      s->isLPDEnabled );
     tr_bencDictAddStr ( d, TR_PREFS_KEY_DOWNLOAD_DIR,                     s->downloadDir );
     tr_bencDictAddInt ( d, TR_PREFS_KEY_DOWNLOAD_QUEUE_SIZE,              tr_sessionGetQueueSize( s, TR_DOWN ) );
@@ -684,7 +686,6 @@ initTlsContext( tr_session * session )
     X509_NAME * name;
 
     SSL_library_init();
-    ERR_load_ERR_strings();
     session->tls_context = SSL_CTX_new( TLSv1_method() );
     SSL_CTX_set_session_id_context( session->tls_context, (const unsigned char*)TR_NAME, sizeof(TR_NAME) );
 
@@ -784,8 +785,6 @@ tr_sessionInitImpl( void * vdata )
         loadBlocklists( session );
     }
 
-    initTlsContext( session );
-
     assert( tr_isSession( session ) );
 
     session->saveTimer = evtimer_new( session->event_base, onSaveTimer, session );
@@ -852,6 +851,8 @@ sessionSetImpl( void * vdata )
         tr_sessionSetDHTEnabled( session, boolVal );
     if( tr_bencDictFindBool( settings, TR_PREFS_KEY_UTP_ENABLED, &boolVal ) )
         tr_sessionSetUTPEnabled( session, boolVal );
+    if( tr_bencDictFindBool( settings, TR_PREFS_KEY_TLS_ENABLED, &boolVal ) )
+        tr_sessionSetTLSEnabled( session, boolVal );
     if( tr_bencDictFindBool( settings, TR_PREFS_KEY_LPD_ENABLED, &boolVal ) )
         tr_sessionSetLPDEnabled( session, boolVal );
     if( tr_bencDictFindInt( settings, TR_PREFS_KEY_ENCRYPTION, &i ) )
@@ -2136,6 +2137,40 @@ tr_sessionSetUTPEnabled( tr_session * session, bool enabled )
     if( ( enabled != 0 ) != ( session->isUTPEnabled != 0 ) )
         tr_runInEventThread( session, toggle_utp, session );
 }
+
+/***
+****
+***/
+
+bool
+tr_sessionIsTLSEnabled( const tr_session * session )
+{
+    assert( tr_isSession( session ) );
+    return session->isTLSEnabled;
+}
+
+static void
+toggle_tls( void * data )
+{
+    tr_session * session = data;
+    assert( tr_isSession( session ) );
+
+    session->isTLSEnabled = !session->isTLSEnabled;
+
+    if ( session->isTLSEnabled && !session->tls_context )
+        initTlsContext( session );
+}
+
+void
+tr_sessionSetTLSEnabled( tr_session * session, bool enabled )
+{
+    assert( tr_isSession( session ) );
+    assert( tr_isBool( enabled ) );
+
+    if( ( enabled != 0 ) != ( session->isTLSEnabled != 0 ) )
+        tr_runInEventThread( session, toggle_tls, session );
+}
+
 
 /***
 ****

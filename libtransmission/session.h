@@ -98,6 +98,7 @@ struct tr_session
     bool                         isPexEnabled;
     bool                         isDHTEnabled;
     bool                         isUTPEnabled;
+    bool                         isTLSEnabled;
     bool                         isLPDEnabled;
     bool                         isBlocklistEnabled;
     bool                         isPrefetchEnabled;
