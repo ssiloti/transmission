@@ -137,7 +137,7 @@ function FileRow(torrent, i)
 
 		name = file.name || 'Unknown';
 		name = name.substring(name.lastIndexOf('/')+1);
-		name = name.replace(/([\/_\.])/g, "$1&#8203;");
+		name = name.replace(/([\/_\.])/g, "$1​");
 		e = document.createElement('div');
 		e.className = "inspector_torrent_file_list_entry_name";
 		setTextContent(e, name);
@@ -171,6 +171,13 @@ function FileRow(torrent, i)
 	};
 	this.isEditable = function () {
 		return (fields.torrent.getFileCount()>1) && !isDone();
+	};
+	this.getPath = function () {
+		var file = torrent.getFile(i);
+        path = file.name.replace(/\/\/+/g,'/')
+		path = path.split('/').slice(0,-1)
+		path.push('t' + fields.torrent.getId() + 'f' + fields.index)
+		return path
 	};
 
 	initialize(torrent, i);
