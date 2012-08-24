@@ -736,6 +736,8 @@ initTlsContext( tr_session * session )
     SSL_CTX_use_PrivateKey( session->tls_context, session->private_key );
     SSL_CTX_set_verify( session->tls_context, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, tlsVerifyCallback);
 
+    X509_pubkey_digest(cert, EVP_sha1(), session->credit_id, NULL);
+
     X509_free( cert );
 }
 

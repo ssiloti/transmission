@@ -1341,6 +1341,19 @@ tr_peerIoSetPeersId( tr_peerIo * io, const uint8_t * peer_id )
         memset( io->peerId, 0, 20 );
 }
 
+bool tr_peerIoGetCreditId( const tr_peerIo * io, uint8_t * buf )
+{
+    X509 * peer_cert;
+
+    if ( !io->tls )
+        return false;
+
+    peer_cert = SSL_get_peer_certificate( io->tls );
+    X509_pubkey_digest(peer_cert, EVP_sha1(), buf, NULL);
+
+    return true;
+}
+
 /**
 ***
 **/

@@ -217,6 +217,7 @@ struct tr_session
     struct tr_bindinfo         * public_ipv6;
 
     uint8_t peer_id[PEER_ID_LEN+1];
+    uint8_t credit_id[SHA_DIGEST_LENGTH];
 
     SSL_CTX                    * tls_context;
     EVP_PKEY                   * private_key;
@@ -232,6 +233,15 @@ static inline const uint8_t*
 tr_getPeerId( tr_session * session )
 {
     return session->peer_id;
+}
+
+static inline const uint8_t*
+tr_getCreditId( tr_session * session )
+{
+    if ( session->tls_context )
+        return session->credit_id;
+    else
+        return NULL;
 }
 
 bool         tr_sessionAllowsDHT( const tr_session * session );
