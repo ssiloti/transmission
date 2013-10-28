@@ -82,16 +82,22 @@
     NSString * partialString, * fullString;
     if ([NSApp isOnMountainLionOrBetter])
     {
-        NSByteCountFormatter *fileSizeFormatter = [[NSByteCountFormatterMtLion alloc] init];
+        NSByteCountFormatter * fileSizeFormatter = [[NSByteCountFormatterMtLion alloc] init];
         
-        //only show units for the partial file size if it's different than the full file size's
-        [fileSizeFormatter setIncludesCount: NO];
-        const BOOL partialUnitsDifferent = ![[fileSizeFormatter stringFromByteCount: partialSize] isEqualToString: [fileSizeFormatter stringFromByteCount: fullSize]];
-        
-        [fileSizeFormatter setIncludesCount: YES];
         fullString = [fileSizeFormatter stringFromByteCount: fullSize];
         
-        [fileSizeFormatter setIncludesUnit: partialUnitsDifferent];
+        //figure out the magniture of the two, since we can't rely on comparing the units because of localization and pluralization issues (for example, "1 byte of 2 bytes")
+        BOOL partialUnitsSame;
+        if (partialSize == 0)
+            partialUnitsSame = YES; //we want to just show "0" when we have no partial data, so always set to the same units
+        else
+        {
+            const unsigned int magnitudePartial = log(partialSize)/log(1000);
+            const unsigned int magnitudeFull = fullSize < 1000 ? 0 : log(fullSize)/log(1000); //we have to catch 0 with a special case, so might as well avoid the math for all of magnitude 0
+            partialUnitsSame = magnitudePartial == magnitudeFull;
+        }
+        
+        [fileSizeFormatter setIncludesUnit: !partialUnitsSame];
         partialString = [fileSizeFormatter stringFromByteCount: partialSize];
         
         [fileSizeFormatter release];
@@ -203,30 +209,31 @@
     return [self compare: string options: comparisonOptions range: NSMakeRange(0, [self length]) locale: [NSLocale currentLocale]];
 }
 
-- (NSArray *) betterComponentsSeparatedByCharactersInSet: (NSCharacterSet *) separator
+- (NSArray *) betterComponentsSeparatedByCharactersInSet: (NSCharacterSet *) separators
 {
     NSMutableArray * components = [NSMutableArray array];
     
-    NSUInteger i = 0;
-    while (i < [self length])
+    NSCharacterSet * includededCharSet = [separators invertedSet];
+    NSUInteger index = 0;
+    const NSUInteger fullLength = [self length];
+    do
     {
-        const NSRange range = [self rangeOfCharacterFromSet: separator options: 0 range: NSMakeRange(i, [self length]-i)];
+        const NSUInteger start = [self rangeOfCharacterFromSet: includededCharSet options: 0 range: NSMakeRange(index, fullLength - index)].location;
+        if (start == NSNotFound)
+            break;
         
-        if (range.location == NSNotFound)
+        const NSRange endRange = [self rangeOfCharacterFromSet: separators options: 0 range: NSMakeRange(start, fullLength - start)];
+        if (endRange.location == NSNotFound)
         {
-            [components addObject: [self substringFromIndex: i]];
+            [components addObject: [self substringFromIndex: start]];
             break;
         }
-        else if (range.location != i)
-        {
-            const NSUInteger length = range.location - i;
-            [components addObject: [self substringWithRange: NSMakeRange(i, length)]];
-            
-            i += length;
-        }
         
-        i += range.length;
+        [components addObject: [self substringWithRange: NSMakeRange(start, endRange.location - start)]];
+        
+        index = NSMaxRange(endRange);
     }
+    while (YES);
     
     return components;
 }

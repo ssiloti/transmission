@@ -4,59 +4,76 @@
 #define LIBTRANSMISSION_TEST_H 1
 
 #include <stdio.h>
-#include <string.h>
 
-static int test = 0;
+#include "transmission.h"
+#include "utils.h" /* tr_strcmp0 () */
 
-#define REPORT_TEST(test, res) \
-    fprintf( stderr, "%s test #%d (%s, %d)\n", res, test, __FILE__, __LINE__ )
+extern int current_test;
 
-#ifdef VERBOSE
-  #define check( A )						\
-    do {							\
-        ++test;							\
-        if( A )							\
-	    REPORT_TEST(test, "PASS");				\
-        else {							\
-	    REPORT_TEST(test, "FAIL");				\
-            return test;					\
-        }							\
-    } while(0)
-#else
-  #define check( A )						\
-    do {							\
-        ++test;							\
-        if( !( A ) ){						\
-	    REPORT_TEST(test, "FAIL");				\
-            return test;					\
-        }							\
-    } while(0)
-#endif
+extern bool verbose;
 
+bool should_print (bool pass);
 
-typedef int (*testFunc)( void );
-#define NUM_TESTS(tarray) ((int) (sizeof(tarray)/sizeof(tarray[0])))
+bool check_condition_impl (const char * file, int line, bool condition);
+bool check_int_eq_impl (const char * file, int line, int64_t expected, int64_t actual);
+bool check_ptr_eq_impl (const char * file, int line, const void * expected, const void * actual);
+bool check_streq_impl (const char * file, int line, const char * expected, const char * actual);
 
-static inline int
-runTests( const testFunc * const tests, int numTests )
-{
-    int ret, i;
+/***
+****
+***/
 
-    (void) test; /* Use test even if we don't have any tests to run */
+#define check(condition) \
+  do { \
+    ++current_test; \
+    if (!check_condition_impl (__FILE__, __LINE__, (condition))) \
+      return current_test; \
+  } while (0)
 
-    for( i = 0; i < numTests; i++ )
-	if( (ret = (*tests[i])()) )
-	    return ret;
+#define check_streq(expected, actual) \
+  do { \
+    ++current_test; \
+    if (!check_streq_impl (__FILE__, __LINE__, (expected), (actual))) \
+      return current_test; \
+  } while (0)
 
-    return 0; 	/* All tests passed */
+#define check_int_eq(expected, actual) \
+  do { \
+    ++current_test; \
+    if (!check_int_eq_impl (__FILE__, __LINE__, (expected), (actual))) \
+      return current_test; \
+  } while (0)
+
+#define check_ptr_eq(expected, actual) \
+  do { \
+    ++current_test; \
+    if (!check_ptr_eq_impl (__FILE__, __LINE__, (expected), (actual))) \
+      return current_test; \
+  } while (0)
+
+/***
+****
+***/
+
+typedef int (*testFunc)(void);
+#define NUM_TESTS(tarray)((int)(sizeof (tarray)/sizeof (tarray[0])))
+
+int runTests (const testFunc * const tests, int numTests);
+
+#define MAIN_SINGLE_TEST(test) \
+int main (void) { \
+    const testFunc tests[] = { test }; \
+    return runTests (tests, 1); \
 }
 
-#define MAIN_SINGLE_TEST(test)					\
-int main( void )							\
-{								\
-    const testFunc tests[] = { test };				\
-								\
-    return runTests(tests, 1);					\
-}
+tr_session * libttest_session_init (struct tr_variant * settings);
+void         libttest_session_close (tr_session * session);
+
+void         libttest_zero_torrent_populate (tr_torrent * tor, bool complete);
+tr_torrent * libttest_zero_torrent_init (tr_session * session);
+
+void         libttest_blockingTorrentVerify (tr_torrent * tor);
+
+
 
 #endif /* !LIBTRANSMISSION_TEST_H */

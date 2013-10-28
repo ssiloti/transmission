@@ -37,8 +37,6 @@
 
 - (void) setupInfo;
 
-- (void) updatePiecesView;
-
 @end
 
 @implementation InfoActivityViewController
@@ -55,7 +53,49 @@
 
 - (void) awakeFromNib
 {
-    [[NSNotificationCenter defaultCenter] addObserver: self selector: @selector(updatePiecesView) name: @"UpdatePiecesView" object: nil];
+    [fTransferSectionLabel sizeToFit];
+    [fDatesSectionLabel sizeToFit];
+    [fTimeSectionLabel sizeToFit];
+    
+    NSArray * labels = @[ fStateLabel, fProgressLabel, fHaveLabel, fDownloadedLabel, fUploadedLabel, fFailedDLLabel, fRatioLabel, fErrorLabel, fDateAddedLabel, fDateCompletedLabel, fDateActivityLabel, fDownloadTimeLabel, fSeedTimeLabel ];
+    
+    CGFloat oldMaxWidth = 0.0, originX, newMaxWidth = 0.0;
+    for (NSTextField * label in labels)
+    {
+        const NSRect oldFrame = [label frame];
+        if (oldFrame.size.width > oldMaxWidth)
+        {
+            oldMaxWidth = oldFrame.size.width;
+            originX = oldFrame.origin.x;
+        }
+        
+        [label sizeToFit];
+        const CGFloat newWidth = [label bounds].size.width;
+        if (newWidth > newMaxWidth)
+            newMaxWidth = newWidth;
+    }
+    
+    for (NSTextField * label in labels)
+    {
+        NSRect frame = [label frame];
+        frame.origin.x = originX + (newMaxWidth - frame.size.width);
+        [label setFrame: frame];
+    }
+    
+    NSArray * fields = @[ fDateAddedField, fDateCompletedField, fDateActivityField, fStateField, fProgressField, fHaveField, fDownloadedTotalField, fUploadedTotalField, fFailedHashField, fRatioField, fDownloadTimeField, fSeedTimeField, fErrorScrollView ];
+    
+    const CGFloat widthIncrease = newMaxWidth - oldMaxWidth;
+    for (NSView * field in fields) {
+        NSRect frame = [field frame];
+        frame.origin.x += widthIncrease;
+        frame.size.width -= widthIncrease;
+        [field setFrame: frame];
+    }
+    
+    //set the click action of the pieces view
+    #warning after 2.8 just hook this up in the xib
+    [fPiecesView setAction:@selector(updatePiecesView:)];
+    [fPiecesView setTarget:self];
 }
 
 - (void) dealloc
@@ -161,7 +201,18 @@
 {
     const BOOL availability = [sender selectedSegment] == PIECES_CONTROL_AVAILABLE;
     [[NSUserDefaults standardUserDefaults] setBool: availability forKey: @"PiecesViewShowAvailability"];
-    [self updatePiecesView];
+    [self updatePiecesView:nil];
+}
+
+
+- (void) updatePiecesView: (id) sender
+{
+    const BOOL piecesAvailableSegment = [[NSUserDefaults standardUserDefaults] boolForKey: @"PiecesViewShowAvailability"];
+    
+    [fPiecesControl setSelected: piecesAvailableSegment forSegment: PIECES_CONTROL_AVAILABLE];
+    [fPiecesControl setSelected: !piecesAvailableSegment forSegment: PIECES_CONTROL_PROGRESS];
+    
+    [fPiecesView updateView];
 }
 
 - (void) clearView
@@ -218,16 +269,6 @@
     }
     
     fSet = YES;
-}
-
-- (void) updatePiecesView
-{
-    const BOOL piecesAvailableSegment = [[NSUserDefaults standardUserDefaults] boolForKey: @"PiecesViewShowAvailability"];
-    
-    [fPiecesControl setSelected: piecesAvailableSegment forSegment: PIECES_CONTROL_AVAILABLE];
-    [fPiecesControl setSelected: !piecesAvailableSegment forSegment: PIECES_CONTROL_PROGRESS];
-    
-    [fPiecesView updateView];
 }
 
 @end

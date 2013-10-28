@@ -3,12 +3,10 @@ dnl STATUS: "X" for prerelease beta builds,
 dnl         "Z" for unsupported trunk builds,
 dnl         "0" for stable, supported releases
 dnl these should be the only two lines you need to change
-m4_define([user_agent_prefix],[2.61+])
-m4_define([peer_id_prefix],[-TR261Z-])
+m4_define([user_agent_prefix],[2.77+])
+m4_define([peer_id_prefix],[-TR277Z-])
 
-AC_INIT([transmission],
-        [user_agent_prefix],
-        [http://trac.transmissionbt.com/newticket])
+AC_INIT([transmission],[user_agent_prefix],[http://trac.transmissionbt.com/newticket])
 AC_SUBST(USERAGENT_PREFIX,[user_agent_prefix])
 AC_SUBST(PEERID_PREFIX,[peer_id_prefix])
 
@@ -18,8 +16,8 @@ AC_CONFIG_MACRO_DIR([m4])
 
 dnl AM_CONFIG_HEADER(config.h)
 AC_CONFIG_SRCDIR(libtransmission/transmission.h)
-AM_INIT_AUTOMAKE([1.9 tar-pax])
-AC_PROG_LIBTOOL
+AM_INIT_AUTOMAKE([1.9 tar-pax no-dist-gzip dist-xz])
+LT_INIT
 
 if test m4_substr(peer_id_prefix,6,1) = "0"; then
   supported_build=yes
@@ -41,7 +39,7 @@ AM_CONDITIONAL(TR_UNSTABLE, test "x$supported_build" = "xno")
 CURL_MINIMUM=7.15.4
 AC_SUBST(CURL_MINIMUM)
 LIBEVENT_MINIMUM=2.0.10
-AC_SUBST(LIBEVENT_MINIUM)
+AC_SUBST(LIBEVENT_MINIMUM)
 OPENSSL_MINIMUM=0.9.4
 AC_SUBST(OPENSSL_MINIMUM)
 
@@ -127,6 +125,7 @@ AC_PATH_ZLIB
 AC_SYS_LARGEFILE
 AC_CHECK_FUNCS([lseek64])
 
+AC_FUNC_GETMNTENT
 
 dnl ----------------------------------------------------------------------------
 dnl
@@ -175,23 +174,6 @@ fi
 
 AC_CHECK_HEADERS([sys/statvfs.h \
                   xfs/xfs.h])
-
-
-dnl ----------------------------------------------------------------------------
-dnl
-dnl va_copy
-
-AC_MSG_CHECKING([how to copy va_list])
-AC_TRY_LINK([#include <stdarg.h>], [va_list ap1, ap2; va_copy(ap1, ap2);],
-    AC_MSG_RESULT([va_copy]),
-        [ AH_TEMPLATE([va_copy], [define if va_copy is not available])
-        AC_TRY_LINK([#include <stdarg.h>], [va_list ap1, ap2; __va_copy(ap1, ap2);],
-        [ AC_DEFINE([va_copy], [__va_copy])
-        AC_MSG_RESULT([__va_copy])],
-        [ AC_DEFINE([va_copy(dest,src)], [memcpy(&dest,&src,sizeof(va_list))])
-        AC_MSG_RESULT([memcpy])]
-    )
-])
 
 
 dnl ----------------------------------------------------------------------------
@@ -255,11 +237,11 @@ upnp_version="none"
 ac_save_LIBS="$LIBS"
 LIBS="-lminiupnpc"
 # See if the OS has its miniupnp 1.5 installed
-AC_TRY_LINK([
+AC_LINK_IFELSE([AC_LANG_PROGRAM([[
     #include <stdlib.h>
     #include <miniupnpc/miniupnpc.h>
     #include <miniupnpc/upnpcommands.h>
-],[
+]], [[
     struct UPNPDev * devlist;
     struct UPNPUrls    urls;
     struct IGDdatas    data;
@@ -271,17 +253,17 @@ AC_TRY_LINK([
     UPNP_GetValidIGD( devlist, &urls, &data, lanaddr, sizeof( lanaddr ) ); 
     UPNP_GetSpecificPortMappingEntry( urls.controlURL, data.first.servicetype,
                         portStr, "TCP", intClient, intPort );
-],[
+]])],[
 AC_DEFINE(HAVE_MINIUPNP_15, 1, [Define to 1 if you have miniupnpc version 1.5])
-upnp_version="1.5"])
+upnp_version="1.5"],[])
 
 # See if the OS has its miniupnp 1.6 installed
-AC_TRY_LINK([
+AC_LINK_IFELSE([AC_LANG_PROGRAM([[
     #include <stdlib.h>
     #include <errno.h>
     #include <miniupnpc/miniupnpc.h>
     #include <miniupnpc/upnpcommands.h>
-],[
+]], [[
     struct UPNPDev * devlist;
     struct UPNPUrls    urls;
     struct IGDdatas    data;
@@ -293,9 +275,9 @@ AC_TRY_LINK([
     UPNP_GetValidIGD( devlist, &urls, &data, lanaddr, sizeof( lanaddr ) ); 
     UPNP_GetSpecificPortMappingEntry( urls.controlURL, data.first.servicetype,
                         portStr, "TCP", intClient, intPort, NULL, NULL, NULL );
-],[
+]])],[
 AC_DEFINE(HAVE_MINIUPNP_16, 1, [Define to 1 if you have miniupnpc version 1.6])
-upnp_version="1.6"])
+upnp_version="1.6"],[])
 
 # ... and the results of our tests
 LIBS="$ac_save_LIBS"
@@ -359,7 +341,7 @@ PKG_CHECK_EXISTS([gtk+-3.0 >= $GTK_MINIMUM
                   gthread-2.0 >= $GLIB_MINIMUM],
                  [have_gtk=yes],
                  [have_gtk=no])
-AC_ARG_WITH([gtk], AC_HELP_STRING([--with-gtk],[with Gtk]),
+AC_ARG_WITH([gtk], AS_HELP_STRING([--with-gtk],[with Gtk]),
             [with_gtk=$withval],
             [with_gtk=$have_gtk])
 AM_CONDITIONAL([BUILD_GTK],[test "x$with_gtk" = "xyes"])
@@ -489,6 +471,7 @@ EOF
 fi
 if test "x$have_darwin" = "xyes"; then
     AC_DEFINE([HAVE_DARWIN], 1)
+    AC_DEFINE([SYS_DARWIN], 1)
 fi
 if test "x$have_msw" = "xyes"; then
     AC_DEFINE([HAVE_MSW], 1)

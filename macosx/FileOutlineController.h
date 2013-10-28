@@ -53,4 +53,6 @@
 
 - (void) revealFile: (id) sender;
 
+- (void) renameSelected: (id) sender;
+
 @end

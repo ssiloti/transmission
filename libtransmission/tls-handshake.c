@@ -29,6 +29,7 @@
 #include "peer-io.h"
 #include "session.h"
 #include "utils.h"
+#include "log.h"
 
 struct tr_sslhandshake
 {
@@ -42,11 +43,13 @@ struct tr_sslhandshake
 ***
 **/
 
-#define dbgmsg( io, ... ) \
-    do { \
-        if( tr_deepLoggingIsActive( ) ) \
-            tr_deepLog( __FILE__, __LINE__, tr_peerIoGetAddrStr( io ), __VA_ARGS__ ); \
-    } while( 0 )
+#define dbgmsg(io, ...) \
+  do \
+    { \
+      if (tr_logGetDeepEnabled ()) \
+        tr_logAddDeep (__FILE__, __LINE__, tr_peerIoGetAddrStr (io), __VA_ARGS__); \
+    } \
+  while (0)
 
 /**
 ***

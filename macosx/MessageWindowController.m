@@ -27,8 +27,8 @@
 #import "NSApplicationAdditions.h"
 #import "NSMutableArrayAdditions.h"
 #import "NSStringAdditions.h"
+#import <log.h>
 #import <transmission.h>
-#import <utils.h>
 
 #define LEVEL_ERROR 0
 #define LEVEL_INFO  1
@@ -114,17 +114,17 @@
     //select proper level in popup button
     switch ([[NSUserDefaults standardUserDefaults] integerForKey: @"MessageLevel"])
     {
-        case TR_MSG_ERR:
+        case TR_LOG_ERROR:
             [fLevelButton selectItemAtIndex: LEVEL_ERROR];
             break;
-        case TR_MSG_INF:
+        case TR_LOG_INFO:
             [fLevelButton selectItemAtIndex: LEVEL_INFO];
             break;
-        case TR_MSG_DBG:
+        case TR_LOG_DEBUG:
             [fLevelButton selectItemAtIndex: LEVEL_DEBUG];
             break;
         default: //safety
-            [[NSUserDefaults standardUserDefaults] setInteger: TR_MSG_ERR forKey: @"MessageLevel"];
+            [[NSUserDefaults standardUserDefaults] setInteger: TR_LOG_ERROR forKey: @"MessageLevel"];
             [fLevelButton selectItemAtIndex: LEVEL_ERROR];
     }
     
@@ -139,6 +139,7 @@
     [[NSNotificationCenter defaultCenter] removeObserver: self];
     
     [fTimer invalidate];
+    [fTimer release];
     [fLock release];
     
     [fMessages release];
@@ -153,7 +154,7 @@
 {
     if (!fTimer)
     {
-        fTimer = [NSTimer scheduledTimerWithTimeInterval: UPDATE_SECONDS target: self selector: @selector(updateLog:) userInfo: nil repeats: YES];
+        fTimer = [[NSTimer scheduledTimerWithTimeInterval: UPDATE_SECONDS target: self selector: @selector(updateLog:) userInfo: nil repeats: YES] retain];
         [self updateLog: nil];
     }
 }
@@ -161,6 +162,7 @@
 - (void) windowWillClose: (id)sender
 {
     [fTimer invalidate];
+    [fTimer release];
     fTimer = nil;
 }
 
@@ -175,14 +177,15 @@
 - (void) window: (NSWindow *) window didDecodeRestorableState: (NSCoder *) coder
 {
     [fTimer invalidate];
-    fTimer = [NSTimer scheduledTimerWithTimeInterval: UPDATE_SECONDS target: self selector: @selector(updateLog:) userInfo: nil repeats: YES];
+    [fTimer release];
+    fTimer = [[NSTimer scheduledTimerWithTimeInterval: UPDATE_SECONDS target: self selector: @selector(updateLog:) userInfo: nil repeats: YES] retain];
     [self updateLog: nil];
 }
 
 - (void) updateLog: (NSTimer *) timer
 {
-    tr_msg_list * messages;
-    if ((messages = tr_getQueuedMessages()) == NULL)
+    tr_log_message * messages;
+    if ((messages = tr_logGetQueue()) == NULL)
         return;
     
     [fLock lock];
@@ -198,7 +201,7 @@
     
     BOOL changed = NO;
     
-    for (tr_msg_list * currentMessage = messages; currentMessage != NULL; currentMessage = currentMessage->next)
+    for (tr_log_message * currentMessage = messages; currentMessage != NULL; currentMessage = currentMessage->next)
     {
         NSString * name = currentMessage->name != NULL ? [NSString stringWithUTF8String: currentMessage->name]
                             : [[NSProcessInfo processInfo] processName];
@@ -223,11 +226,11 @@
         }
     }
     
-    if ([fMessages count] > TR_MAX_MSG_LOG)
+    if ([fMessages count] > TR_LOG_MAX_QUEUE_LENGTH)
     {
         const NSUInteger oldCount = [fDisplayedMessages count];
         
-        NSIndexSet * removeIndexes = [NSIndexSet indexSetWithIndexesInRange: NSMakeRange(0, [fMessages count]-TR_MAX_MSG_LOG)];
+        NSIndexSet * removeIndexes = [NSIndexSet indexSetWithIndexesInRange: NSMakeRange(0, [fMessages count]-TR_LOG_MAX_QUEUE_LENGTH)];
         NSArray * itemsToRemove = [fMessages objectsAtIndexes: removeIndexes];
         
         [fMessages removeObjectsAtIndexes: removeIndexes];
@@ -247,7 +250,7 @@
     
     [fLock unlock];
     
-    tr_freeMessageList(messages);
+    tr_logFreeQueue (messages);
 }
 
 - (NSInteger) numberOfRowsInTableView: (NSTableView *) tableView
@@ -267,11 +270,11 @@
         const NSInteger level = [[message objectForKey: @"Level"] integerValue];
         switch (level)
         {
-            case TR_MSG_ERR:
+            case TR_LOG_ERROR:
                 return [NSImage imageNamed: @"RedDot"];
-            case TR_MSG_INF:
+            case TR_LOG_INFO:
                 return [NSImage imageNamed: @"YellowDot"];
-            case TR_MSG_DBG:
+            case TR_LOG_DEBUG:
                 return [NSImage imageNamed: @"PurpleDot"];
             default:
                 NSAssert1(NO, @"Unknown message log level: %ld", level);
@@ -291,6 +294,7 @@
     
     NSTableColumn * column = [tableView tableColumnWithIdentifier: @"Message"];
     const CGFloat count = floorf([message sizeWithAttributes: fAttributes].width / [column width]);
+    
     return [tableView rowHeight] * (count + 1.0);
 }
 
@@ -338,13 +342,13 @@
     switch ([fLevelButton indexOfSelectedItem])
     {
         case LEVEL_ERROR:
-            level = TR_MSG_ERR;
+            level = TR_LOG_ERROR;
             break;
         case LEVEL_INFO:
-            level = TR_MSG_INF;
+            level = TR_LOG_INFO;
             break;
         case LEVEL_DEBUG:
-            level = TR_MSG_DBG;
+            level = TR_LOG_DEBUG;
             break;
         default:
             NSAssert1(NO, @"Unknown message log level: %ld", [fLevelButton indexOfSelectedItem]);
@@ -531,13 +535,13 @@
     const NSInteger level = [[message objectForKey: @"Level"] integerValue];
     switch (level)
     {
-        case TR_MSG_ERR:
+        case TR_LOG_ERROR:
             levelString = NSLocalizedString(@"Error", "Message window -> level");
             break;
-        case TR_MSG_INF:
+        case TR_LOG_INFO:
             levelString = NSLocalizedString(@"Info", "Message window -> level");
             break;
-        case TR_MSG_DBG:
+        case TR_LOG_DEBUG:
             levelString = NSLocalizedString(@"Debug", "Message window -> level");
             break;
         default:
